@@ -1,2 +1,17 @@
-.env
+# Python
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+
+# Allow example configuration
+!.env.example
+
+# Editor files
+.vscode/
+.idea/
