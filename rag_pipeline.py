@@ -6,10 +6,17 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from retriever import retrieve_chunks
+
 from prompts import (
     SYSTEM_PROMPT,
     build_context,
     build_user_prompt,
+)
+
+from evaluation import (
+    DEFAULT_DISTANCE_THRESHOLD,
+    evaluate_retrieval,
+    filter_relevant_chunks,
 )
 
 
@@ -26,8 +33,8 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 FALLBACK_ANSWER = (
-    "В предоставленных документах недостаточно информации "
-    "для ответа на этот вопрос."
+    "В предоставленных документах недостаточно "
+    "информации для ответа на этот вопрос."
 )
 
 
@@ -38,8 +45,7 @@ def get_llm_client() -> OpenAI:
 
     if not api_key:
         raise ValueError(
-            "API key is missing. "
-            "Set GROQ_API_KEY or OPENAI_API_KEY in .env"
+            "Set GROQ_API_KEY in your .env file"
         )
 
     return OpenAI(
@@ -49,7 +55,7 @@ def get_llm_client() -> OpenAI:
 
 
 def generate_answer(question: str, context: str) -> str:
-    """Генерирует ответ на основе найденного контекста."""
+    """Генерирует ответ только по найденному контексту."""
 
     client = get_llm_client()
 
@@ -84,9 +90,10 @@ def generate_answer(question: str, context: str) -> str:
 
 def rag_pipeline(
     question: str,
-    top_k: int = 3
+    top_k: int = 3,
+    distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD
 ) -> dict:
-    """Выполняет полный RAG pipeline."""
+    """Выполняет RAG с фильтрацией слабого контекста."""
 
     if not question.strip():
         raise ValueError("Question cannot be empty")
@@ -94,66 +101,81 @@ def rag_pipeline(
     if top_k <= 0:
         raise ValueError("top_k must be greater than 0")
 
-    logger.info("Received question: %s", question)
+    logger.info("Question: %s", question)
 
-    # Step 1. Retrieve relevant chunks
+    # Step 1. Retrieval
     chunks = retrieve_chunks(
         query=question,
         top_k=top_k
     )
 
-    # Step 2. Handle empty retrieval
-    if not chunks:
-        logger.warning("No relevant chunks retrieved")
+    # Step 2. Evaluate retrieval
+    evaluation = evaluate_retrieval(
+        chunks=chunks,
+        distance_threshold=distance_threshold
+    )
+
+    logger.info(
+        "Retrieval: total=%s, accepted=%s, best_distance=%s",
+        evaluation.retrieved_count,
+        evaluation.accepted_count,
+        evaluation.best_distance
+    )
+
+    # Step 3. Reject weak context
+    if not evaluation.is_relevant:
+        logger.warning("Insufficient context. Skipping LLM call.")
 
         return {
             "question": question,
             "answer": FALLBACK_ANSWER,
             "sources": [],
-            "context": ""
+            "context": "",
+            "status": "insufficient_context",
+            "retrieval_evaluation": evaluation
         }
 
-    # Step 3. Build context
-    context = build_context(chunks)
+    # Step 4. Keep relevant chunks
+    relevant_chunks = filter_relevant_chunks(
+        chunks=chunks,
+        distance_threshold=distance_threshold
+    )
 
-    logger.info("Context created from %s chunks", len(chunks))
+    # Step 5. Build context
+    context = build_context(relevant_chunks)
 
-    # Step 4. Generate answer
+    # Step 6. Generate answer
     answer = generate_answer(
         question=question,
         context=context
     )
 
-    # Step 5. Prepare sources
+    # Step 7. Prepare sources
     sources = []
 
-    for index, chunk in enumerate(chunks, start=1):
-
-        source = {
+    for index, chunk in enumerate(relevant_chunks, start=1):
+        sources.append({
             "reference": index,
             "document_id": chunk["document_id"],
             "source_name": chunk["source_name"],
             "chunk_id": chunk["chunk_id"],
-            "distance": chunk["distance"],
-        }
+            "distance": chunk["distance"]
+        })
 
-        sources.append(source)
-
-    # Step 6. Return structured result
-    result = {
+    # Step 8. Return result
+    return {
         "question": question,
         "answer": answer,
         "sources": sources,
-        "context": context
+        "context": context,
+        "status": "answered",
+        "retrieval_evaluation": evaluation
     }
 
-    logger.info("RAG pipeline completed")
-
-    return result
 
 
 def main():
-    """Запускает интерактивный RAG."""
+    """Интерактивный запуск RAG."""
 
     print("=" * 60)
     print("RAG QUESTION ANSWERING SYSTEM")
@@ -163,21 +185,26 @@ def main():
 
     result = rag_pipeline(
         question=question,
-        top_k=3
+        top_k=3,
+        distance_threshold=0.5
     )
 
     print("\n" + "=" * 60)
     print("ANSWER")
     print("=" * 60)
-
     print(result["answer"])
 
-    print("\n" + "=" * 60)
-    print("SOURCES")
-    print("=" * 60)
+    print(f"\nStatus: {result['status']}")
+
+    evaluation = result["retrieval_evaluation"]
+
+    print(f"Retrieved chunks: {evaluation.retrieved_count}")
+    print(f"Accepted chunks: {evaluation.accepted_count}")
+    print(f"Best distance: {evaluation.best_distance}")
+
+    print("\nSOURCES")
 
     for source in result["sources"]:
-
         print(
             f"[{source['reference']}] "
             f"{source['source_name']} | "
